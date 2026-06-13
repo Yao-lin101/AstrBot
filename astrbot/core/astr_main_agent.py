@@ -840,7 +840,9 @@ async def _process_quote_message(
                         path,
                         cfg,
                     )
-                    if path and _is_generated_compressed_image_path(path, compress_path):
+                    if path and _is_generated_compressed_image_path(
+                        path, compress_path
+                    ):
                         event.track_temporary_local_file(compress_path)
                     img_cap_prompt = (
                         cfg.get("image_caption_prompt") or "Please describe the image."
