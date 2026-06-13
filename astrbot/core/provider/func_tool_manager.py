@@ -250,8 +250,18 @@ class _PermissionGuardedTool(FunctionTool):
             return error
 
         # Delegate to handler first (plugin tools).
+        # Plugin tool handlers expect an AstrMessageEvent as their first
+        # argument, but when invoked through this proxy the caller passes a
+        # ContextWrapper.  Extract the underlying event so that the handler
+        # receives the correct type.
         if self._wrapped.handler is not None:
-            result = self._wrapped.handler(context, **kwargs)
+            from astrbot.core.agent.run_context import ContextWrapper
+
+            if isinstance(context, ContextWrapper):
+                handler_ctx = context.context.event
+            else:
+                handler_ctx = context
+            result = self._wrapped.handler(handler_ctx, **kwargs)
             if _inspect.isasyncgen(result):
                 last: Any = None
                 async for item in result:
