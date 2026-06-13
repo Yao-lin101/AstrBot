@@ -988,6 +988,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     role="tool",
                     tool_call_id=tool_call_id,
                     content=self._merge_follow_up_notice(content),
+                    name=func_tool_name,
                 ),
             )
 
