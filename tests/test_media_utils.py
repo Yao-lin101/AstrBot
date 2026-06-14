@@ -538,3 +538,20 @@ async def test_tencent_silk_encoding_uses_pysilk_tencent_format(tmp_path, monkey
     assert silk_bytes.startswith(b"\x02#!SILK_V3")
     assert resolved_silk_bytes.startswith(b"\x02#!SILK_V3")
     assert not resolved_silk_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_ensure_jpeg_skips_gif_and_animated_images(tmp_path, monkeypatch):
+    from PIL import Image as PILImage
+
+    temp_dir = tmp_path / "temp"
+    monkeypatch.setattr(media_utils, "get_astrbot_temp_path", lambda: str(temp_dir))
+    image_path = tmp_path / "image.gif"
+
+    # Save a 2x2 GIF image
+    PILImage.new("RGB", (2, 2), (255, 0, 0)).save(image_path, format="GIF")
+
+    converted_path = await media_utils.ensure_jpeg(str(image_path))
+
+    assert converted_path == str(image_path)
+    assert not temp_dir.exists()

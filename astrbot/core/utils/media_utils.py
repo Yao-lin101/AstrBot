@@ -1216,6 +1216,11 @@ async def ensure_jpeg(image_path: str, output_path: str | None = None) -> str:
 
     with PILImage.open(source_path) as opened_img:
         image_format = str(opened_img.format or "").upper()
+        is_animated = getattr(opened_img, "is_animated", False)
+
+    # Do not convert animated images or GIFs to JPEG to preserve animation
+    if image_format == "GIF" or is_animated:
+        return image_path
 
     if image_format == "JPEG" and source_path.suffix.lower() in {".jpg", ".jpeg"}:
         return image_path
