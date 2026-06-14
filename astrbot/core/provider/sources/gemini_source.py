@@ -973,6 +973,11 @@ class ProviderGoogleGenAI(Provider):
         """组装上下文。"""
 
         async def resolve_image_part(image_url: str) -> dict | None:
+            if image_url.startswith("data:"):
+                return {
+                    "type": "image_url",
+                    "image_url": {"url": image_url},
+                }
             if image_url.startswith("http"):
                 image_path = await download_image_by_url(image_url)
                 image_data = await self.encode_image_bs64(image_path)
@@ -1086,6 +1091,8 @@ class ProviderGoogleGenAI(Provider):
 
     async def encode_image_bs64(self, image_url: str) -> str:
         """将图片转换为 base64"""
+        if image_url.startswith("data:"):
+            return image_url
         if image_url.startswith("base64://"):
             return image_url.replace("base64://", "data:image/jpeg;base64,")
         with open(image_url, "rb") as f:

@@ -738,6 +738,21 @@ class ProviderAnthropic(Provider):
         """组装上下文，支持文本和图片"""
 
         async def resolve_image_url(image_url: str) -> dict | None:
+            if image_url.startswith("data:"):
+                try:
+                    header, raw_base64 = image_url.split("base64,", 1)
+                    mime_type = header.split(";")[0].split(":")[1]
+                except Exception:
+                    mime_type = "image/jpeg"
+                    raw_base64 = image_url
+                return {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": mime_type,
+                        "data": raw_base64,
+                    },
+                }
             if image_url.startswith("http"):
                 image_path = await download_image_by_url(image_url)
                 image_data, mime_type = await self.encode_image_bs64(image_path)
@@ -818,6 +833,13 @@ class ProviderAnthropic(Provider):
 
     async def encode_image_bs64(self, image_url: str) -> tuple[str, str]:
         """将图片转换为 base64，同时检测实际 MIME 类型"""
+        if image_url.startswith("data:"):
+            try:
+                header, _ = image_url.split("base64,", 1)
+                mime_type = header.split(";")[0].split(":")[1]
+            except Exception:
+                mime_type = "image/jpeg"
+            return image_url, mime_type
         if image_url.startswith("base64://"):
             raw_base64 = image_url.replace("base64://", "")
             try:
