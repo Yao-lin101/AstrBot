@@ -1886,9 +1886,10 @@ def test_astrbot_web_request_proxy_exposes_typed_methods():
 
     assert isinstance(plugin_request, PluginRequestProxy)
     assert get_type_hints(type(plugin_request).form)["return"] == PluginMultiDict[str]
-    assert get_type_hints(type(plugin_request).files)["return"] == PluginMultiDict[
-        PluginUploadFile
-    ]
+    assert (
+        get_type_hints(type(plugin_request).files)["return"]
+        == PluginMultiDict[PluginUploadFile]
+    )
 
 
 @pytest.mark.asyncio
@@ -2193,11 +2194,30 @@ async def test_v1_token_file_is_public(
     assert response.headers["content-type"].startswith("text/plain")
 
 
+def _get_flat_paths_and_types(routes, prefix=""):
+    results = []
+    for route in routes:
+        if type(route).__name__ == "_IncludedRouter":
+            sub_prefix = prefix + (route.include_context.prefix or "")
+            results.extend(
+                _get_flat_paths_and_types(
+                    route.original_router.routes, prefix=sub_prefix
+                )
+            )
+        elif hasattr(route, "routes"):
+            sub_prefix = prefix + getattr(route, "prefix", "")
+            results.extend(_get_flat_paths_and_types(route.routes, prefix=sub_prefix))
+        else:
+            path = getattr(route, "path", None)
+            if path is not None:
+                results.append((prefix + path, route.__class__.__name__))
+    return results
+
+
 def test_v1_openapi_alias_websocket_routes_are_mounted(asgi_app):
+    flat_routes = _get_flat_paths_and_types(asgi_app.router.routes)
     websocket_paths = {
-        route.path
-        for route in asgi_app.router.routes
-        if "websocket" in route.__class__.__name__.lower()
+        path for path, class_name in flat_routes if "websocket" in class_name.lower()
     }
 
     assert "/api/v1/chat/ws" in websocket_paths
@@ -2206,10 +2226,9 @@ def test_v1_openapi_alias_websocket_routes_are_mounted(asgi_app):
 
 
 def test_dashboard_config_aliases_are_registered_on_fastapi(asgi_app):
+    flat_routes = _get_flat_paths_and_types(asgi_app.router.routes)
     http_paths = {
-        route.path
-        for route in asgi_app.router.routes
-        if "route" in route.__class__.__name__.lower()
+        path for path, class_name in flat_routes if "route" in class_name.lower()
     }
 
     assert "/api/config/platform/list" in http_paths
