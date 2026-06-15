@@ -457,7 +457,18 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
     async def _iter_llm_responses(
         self, *, include_model: bool = True
     ) -> T.AsyncGenerator[LLMResponse, None]:
-        """Yields chunks *and* a final LLMResponse."""
+        """Yields chunks and a final LLMResponse.
+
+        Args:
+            include_model: Whether to include explicit model configuration in request payload.
+
+        Yields:
+            Chunks and a final LLMResponse.
+
+        Raises:
+            EmptyModelOutputError: If the provider returned an empty response and no tools
+                were executed yet.
+        """
         payload = {
             "contexts": self._sanitize_contexts_for_provider(self.run_context.messages),
             "func_tool": self._func_tool_for_provider(),
@@ -468,12 +479,23 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         if include_model:
             # For primary provider we keep explicit model selection if provided.
             payload["model"] = self.req.model
-        if self.streaming:
-            stream = self.provider.text_chat_stream(**payload)
-            async for resp in stream:  # type: ignore
-                yield resp
-        else:
-            yield await self.provider.text_chat(**payload)
+        try:
+            if self.streaming:
+                stream = self.provider.text_chat_stream(**payload)
+                async for resp in stream:  # type: ignore
+                    yield resp
+            else:
+                yield await self.provider.text_chat(**payload)
+        except EmptyModelOutputError:
+            if self.req.tool_calls_result:
+                # If we have already executed tools in this request,
+                # an empty response from the LLM is a valid way to terminate the turn.
+                logger.info(
+                    "LLM returned empty response after tool executions; terminating loop."
+                )
+                yield LLMResponse(role="assistant", completion_text="")
+            else:
+                raise
 
     async def _iter_llm_responses_with_fallback(
         self,

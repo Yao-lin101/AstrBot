@@ -1741,6 +1741,64 @@ async def test_follow_up_after_stop_not_merged_into_tool_result(
         assert ticket_before.resolved.is_set()
 
 
+class MockEmptyOutputProviderAfterTool(MockProvider):
+    """Mock provider that returns a tool call on the first call and empty output thereafter."""
+
+    async def text_chat(self, **kwargs) -> LLMResponse:
+        self.call_count += 1
+        if self.call_count == 1:
+            # First call returns a tool call
+            return LLMResponse(
+                role="assistant",
+                completion_text="我需要使用工具",
+                tools_call_name=["test_tool"],
+                tools_call_args=[{"query": "test"}],
+                tools_call_ids=["call_123"],
+            )
+        else:
+            # Subsequent call returns empty output
+            raise EmptyModelOutputError("model returned no usable output")
+
+
+@pytest.mark.asyncio
+async def test_empty_output_allowed_after_tool_execution(
+    runner, provider_request, mock_tool_executor, mock_hooks
+):
+    """Test that EmptyModelOutputError is suppressed and handled as successful turn end
+
+    if tool calls have already been executed in the current request.
+
+    Args:
+        runner: The runner instance.
+        provider_request: The provider request instance.
+        mock_tool_executor: The mock tool executor instance.
+        mock_hooks: The mock hooks instance.
+    """
+    provider = MockEmptyOutputProviderAfterTool()
+    await runner.reset(
+        provider=provider,
+        request=provider_request,
+        run_context=ContextWrapper(context=None),
+        tool_executor=mock_tool_executor,
+        agent_hooks=mock_hooks,
+        streaming=False,
+    )
+
+    responses = []
+    async for resp in runner.step_until_done(5):
+        responses.append(resp)
+
+    # The agent should complete successfully
+    assert runner.done() is True
+    # The final LLM response should be an empty assistant response
+    final_resp = runner.get_final_llm_resp()
+    assert final_resp is not None
+    assert final_resp.role == "assistant"
+    assert final_resp.completion_text == ""
+    # Should have called the provider twice: once for the tool call, and once for the empty response
+    assert provider.call_count == 2
+
+
 if __name__ == "__main__":
     # 运行测试
     pytest.main([__file__, "-v"])
