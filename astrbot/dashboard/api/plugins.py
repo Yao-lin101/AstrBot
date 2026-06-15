@@ -1424,3 +1424,11 @@ async def dashboard_plugin_extension_route(
     username: str = Depends(require_dashboard_user),
 ):
     return await _call_plugin_extension(plugin_path, request, username)
+
+
+@legacy_router.api_route("/api/public/plug/{plugin_path:path}", methods=["GET", "POST"])
+async def dashboard_public_plugin_extension_route(
+    plugin_path: str,
+    request: Request,
+):
+    return await _call_plugin_extension(plugin_path, request, "public")
