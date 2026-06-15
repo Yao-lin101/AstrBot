@@ -250,6 +250,7 @@ class AstrBotDashboard:
             "/api/platform/webhook",
             "/api/stat/start-time",
             "/api/backup/download",  # 备份下载使用 URL 参数传递 token
+            "/api/public/plug",  # 公共插件网关，允许未授权访问
         ]
         if path in allowed_exact_endpoints or any(
             path.startswith(prefix) for prefix in allowed_endpoint_prefixes
