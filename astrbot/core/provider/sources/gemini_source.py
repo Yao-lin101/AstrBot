@@ -382,8 +382,12 @@ class ProviderGoogleGenAI(Provider):
                             and any(
                                 isinstance(tool, dict)
                                 and isinstance(tool.get("extra_content"), dict)
-                                and isinstance(tool["extra_content"].get("google"), dict)
-                                and tool["extra_content"]["google"].get("thought_signature")
+                                and isinstance(
+                                    tool["extra_content"].get("google"), dict
+                                )
+                                and tool["extra_content"]["google"].get(
+                                    "thought_signature"
+                                )
                                 for tool in message["tool_calls"]
                             )
                         ):
