@@ -44,3 +44,34 @@ async def test_gemini_encode_image_data_uri():
     assert len(context["content"]) == 2  # text placeholder + image_part
     assert context["content"][1]["type"] == "image_url"
     assert context["content"][1]["image_url"]["url"] == data_uri
+
+
+def test_gemini_proxy_no_proxy_mounts(monkeypatch):
+    import httpx
+    # Mock environment variables
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1,cli-proxy-api")
+
+    config = {
+        "proxy": "http://mihomo:7897",
+        "key": ["fake_key"],
+        "api_base": "https://generativelanguage.googleapis.com",
+    }
+
+    provider = ProviderGoogleGenAI(config, {})
+
+    client = provider._http_client
+    assert client is not None
+
+    # Verify mounts routing
+    t_cli = client._transport_for_url(httpx.URL("http://cli-proxy-api:8317/v1beta/models"))
+    t_google = client._transport_for_url(httpx.URL("https://generativelanguage.googleapis.com/v1beta/models"))
+
+    # Bypassed local endpoint
+    cli_proxy = getattr(t_cli, "_proxy_url", None) or getattr(getattr(t_cli, "_pool", None), "_proxy_url", None)
+    assert cli_proxy is None
+
+    # Proxied endpoint
+    google_proxy = getattr(t_google, "_proxy_url", None) or getattr(getattr(t_google, "_pool", None), "_proxy_url", None)
+    assert google_proxy is not None
+    assert google_proxy.host == b"mihomo"
+    assert google_proxy.port == 7897

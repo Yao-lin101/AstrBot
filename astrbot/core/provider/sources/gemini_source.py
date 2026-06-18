@@ -97,8 +97,38 @@ class ProviderGoogleGenAI(Provider):
         if proxy:
             async_client_kwargs["proxy"] = proxy
             async_client_kwargs["trust_env"] = False
+            logger.info(f"[Gemini] 使用代理: {proxy}")
+
+            import os
+
+            no_proxy = os.environ.get("no_proxy", os.environ.get("NO_PROXY", ""))
+            if not no_proxy:
+                try:
+                    from astrbot.core import astrbot_config
+
+                    no_proxy_list = astrbot_config.get("no_proxy", [])
+                    if isinstance(no_proxy_list, list):
+                        no_proxy = ",".join(no_proxy_list)
+                except Exception as config_err:
+                    logger.debug(f"[Gemini] 读取全局 no_proxy 失败: {config_err}")
+
+            logger.info(f"[Gemini] 代理绕过检测 - no_proxy 列表: {no_proxy}")
+            if no_proxy:
+                mounts = {}
+                for host in no_proxy.split(","):
+                    host = host.strip()
+                    if not host:
+                        continue
+                    if "://" in host:
+                        mounts[host] = None
+                    else:
+                        mounts[f"all://*{host}"] = None
+                        mounts[f"all://{host}"] = None
+                async_client_kwargs["mounts"] = mounts
+                logger.info(f"[Gemini] 已加载代理绕过 mounts: {list(mounts.keys())}")
         else:
             async_client_kwargs["trust_env"] = True
+            logger.info("[Gemini] 未配置独立代理，使用 trust_env=True")
 
         # Track the previous client so it can be closed in terminate() instead
         # of leaking when _init_client is called again (e.g. via set_key).
@@ -737,61 +767,74 @@ class ProviderGoogleGenAI(Provider):
         accumulated_reasoning = ""
         final_response = None
 
-        async for chunk in result:
-            llm_response = LLMResponse("assistant", is_chunk=True)
+        try:
+            async for chunk in result:
+                llm_response = LLMResponse("assistant", is_chunk=True)
 
-            if not chunk.candidates:
-                logger.warning(f"Gemini stream chunk has empty candidates: {chunk}")
-                continue
-            if not chunk.candidates[0].content:
-                logger.warning(f"Gemini stream chunk has empty content: {chunk}")
-                continue
+                if not chunk.candidates:
+                    logger.warning(f"Gemini stream chunk has empty candidates: {chunk}")
+                    continue
+                if not chunk.candidates[0].content:
+                    logger.warning(f"Gemini stream chunk has empty content: {chunk}")
+                    continue
 
-            if chunk.candidates[0].content.parts and any(
-                part.function_call for part in chunk.candidates[0].content.parts
-            ):
-                llm_response = LLMResponse("assistant", is_chunk=False)
-                llm_response.raw_completion = chunk
-                llm_response.result_chain = self._process_content_parts(
-                    chunk.candidates[0],
-                    llm_response,
-                    validate_output=False,
-                )
-                llm_response.id = chunk.response_id
-                if chunk.usage_metadata:
-                    llm_response.usage = self._extract_usage(chunk.usage_metadata)
-                yield llm_response
-                return
-
-            _f = False
-
-            # 提取 reasoning content
-            reasoning = self._extract_reasoning_content(chunk.candidates[0])
-            if reasoning:
-                _f = True
-                accumulated_reasoning += reasoning
-                llm_response.reasoning_content = reasoning
-            if chunk.text:
-                _f = True
-                accumulated_text += chunk.text
-                llm_response.result_chain = MessageChain(chain=[Comp.Plain(chunk.text)])
-            if _f:
-                yield llm_response
-
-            if chunk.candidates[0].finish_reason:
-                # Process the final chunk for potential tool calls or other content
-                if chunk.candidates[0].content.parts:
-                    final_response = LLMResponse("assistant", is_chunk=False)
-                    final_response.raw_completion = chunk
-                    final_response.result_chain = self._process_content_parts(
+                if chunk.candidates[0].content.parts and any(
+                    part.function_call for part in chunk.candidates[0].content.parts
+                ):
+                    llm_response = LLMResponse("assistant", is_chunk=False)
+                    llm_response.raw_completion = chunk
+                    llm_response.result_chain = self._process_content_parts(
                         chunk.candidates[0],
-                        final_response,
+                        llm_response,
                         validate_output=False,
                     )
-                    final_response.id = chunk.response_id
+                    llm_response.id = chunk.response_id
                     if chunk.usage_metadata:
-                        final_response.usage = self._extract_usage(chunk.usage_metadata)
-                break
+                        llm_response.usage = self._extract_usage(chunk.usage_metadata)
+                    yield llm_response
+                    return
+
+                _f = False
+
+                # 提取 reasoning content
+                reasoning = self._extract_reasoning_content(chunk.candidates[0])
+                if reasoning:
+                    _f = True
+                    accumulated_reasoning += reasoning
+                    llm_response.reasoning_content = reasoning
+                if chunk.text:
+                    _f = True
+                    accumulated_text += chunk.text
+                    llm_response.result_chain = MessageChain(
+                        chain=[Comp.Plain(chunk.text)]
+                    )
+                if _f:
+                    yield llm_response
+
+                if chunk.candidates[0].finish_reason:
+                    # Process the final chunk for potential tool calls or other content
+                    if chunk.candidates[0].content.parts:
+                        final_response = LLMResponse("assistant", is_chunk=False)
+                        final_response.raw_completion = chunk
+                        final_response.result_chain = self._process_content_parts(
+                            chunk.candidates[0],
+                            final_response,
+                            validate_output=False,
+                        )
+                        final_response.id = chunk.response_id
+                        if chunk.usage_metadata:
+                            final_response.usage = self._extract_usage(
+                                chunk.usage_metadata
+                            )
+                    break
+        finally:
+            if hasattr(result, "aclose"):
+                try:
+                    await result.aclose()
+                except Exception as close_err:
+                    logger.debug(
+                        f"[Gemini] Error closing stream generator: {close_err}"
+                    )
 
         # Yield final complete response with accumulated text
         if not final_response:
