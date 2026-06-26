@@ -249,19 +249,15 @@ class _PermissionGuardedTool(FunctionTool):
         if error is not None:
             return error
 
-        # Delegate to handler first (plugin tools).
-        # Plugin tool handlers expect an AstrMessageEvent as their first
-        # argument, but when invoked through this proxy the caller passes a
-        # ContextWrapper.  Extract the underlying event so that the handler
-        # receives the correct type.
+        # @filter.llm_tool decorated tools have a handler attribute, which is the actual callable.
         if self._wrapped.handler is not None:
             from astrbot.core.agent.run_context import ContextWrapper
 
             if isinstance(context, ContextWrapper):
-                handler_ctx = context.context.event
+                event = context.context.event
             else:
-                handler_ctx = context
-            result = self._wrapped.handler(handler_ctx, **kwargs)
+                event = context
+            result = self._wrapped.handler(event, **kwargs)
             if _inspect.isasyncgen(result):
                 last: Any = None
                 async for item in result:
@@ -271,11 +267,12 @@ class _PermissionGuardedTool(FunctionTool):
                 return await result
             return result
 
-        # Fall back to overridden call() on subclasses (e.g. MCPTool).
+        # If the tool has a "call" method that is not the default FunctionTool.call, invoke it.
         call_override = getattr(type(self._wrapped), "call", None)
         if call_override is not None and call_override is not FunctionTool.call:
             return await self._wrapped.call(context, **kwargs)
 
+        # Compatibility fallback: if the tool has a "run" method, invoke it. This is for legacy tools that don't use the new handler/call interface.
         run = getattr(self._wrapped, "run", None)
         if run is not None:
             event = context.context.event
