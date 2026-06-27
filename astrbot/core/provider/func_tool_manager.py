@@ -251,9 +251,7 @@ class _PermissionGuardedTool(FunctionTool):
 
         # @filter.llm_tool decorated tools have a handler attribute, which is the actual callable.
         if self._wrapped.handler is not None:
-            from astrbot.core.agent.run_context import ContextWrapper
-
-            if isinstance(context, ContextWrapper):
+            if hasattr(context, "context") and hasattr(context.context, "event"):
                 event = context.context.event
             else:
                 event = context
