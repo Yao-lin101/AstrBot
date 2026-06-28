@@ -281,6 +281,9 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         self._follow_up_seq = 0
         self._last_tool_name: str | None = None
         self._same_tool_streak = 0
+        self._last_llm_response_text = None
+        self._last_llm_tool_calls = None
+        self._llm_response_repetition_count = 0
 
         # These two are used for tool schema mode handling
         # We now have two modes:
@@ -793,6 +796,33 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
 
         # 处理 LLM 响应
         llm_resp = llm_resp_result
+
+        # Check for identical consecutive responses to prevent infinite tool loops
+        current_tool_calls = None
+        if llm_resp.tools_call_name:
+            current_tool_calls = list(zip(llm_resp.tools_call_name, llm_resp.tools_call_args or []))
+
+        if (
+            self._last_llm_response_text == llm_resp.completion_text
+            and self._last_llm_tool_calls == current_tool_calls
+            and (llm_resp.completion_text or current_tool_calls)
+        ):
+            self._llm_response_repetition_count += 1
+        else:
+            self._last_llm_response_text = llm_resp.completion_text
+            self._last_llm_tool_calls = current_tool_calls
+            self._llm_response_repetition_count = 1
+
+        if self._llm_response_repetition_count >= 3:
+            logger.warning(
+                "Agent detected repetition loop: LLM generated identical response 3 times consecutively. Terminating tool loop."
+            )
+            # Disable tools and clear tool calls to force completion and stop execution
+            if self.req:
+                self.req.func_tool = None
+            llm_resp.tools_call_name = []
+            llm_resp.tools_call_args = []
+            llm_resp.tools_call_ids = []
 
         if llm_resp.role == "err":
             # 如果 LLM 响应错误，转换到错误状态
