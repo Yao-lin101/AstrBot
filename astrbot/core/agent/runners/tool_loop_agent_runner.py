@@ -800,7 +800,9 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         # Check for identical consecutive responses to prevent infinite tool loops
         current_tool_calls = None
         if llm_resp.tools_call_name:
-            current_tool_calls = list(zip(llm_resp.tools_call_name, llm_resp.tools_call_args or []))
+            current_tool_calls = list(
+                zip(llm_resp.tools_call_name, llm_resp.tools_call_args or [])
+            )
 
         if (
             self._last_llm_response_text == llm_resp.completion_text
