@@ -350,7 +350,7 @@ class SequentialToolProvider(MockProvider):
         )
         return LLMResponse(
             role="assistant",
-            completion_text="",
+            completion_text=f"step-{self.call_count}",
             tools_call_name=[tool_name],
             tools_call_args=[tool_args],
             tools_call_ids=[f"call_{self.call_count}"],
