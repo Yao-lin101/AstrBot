@@ -797,7 +797,6 @@ async def test_tencent_silk_encoding_uses_pysilk_tencent_format(
     assert resolved_silk_bytes.startswith(b"\x02#!SILK_V3")
     assert not resolved_silk_path.exists()
 
-
 def _make_wav(path, rate, channels=1, secs=0.2, freq=440):
     """Write a short sine-tone WAV at the given rate/channels."""
     nframes = int(rate * secs)
@@ -871,3 +870,4 @@ async def test_wav_to_tencent_silk_skips_resample_for_supported_rate(
 
     assert len(fake.calls) == 1
     assert fake.calls[0]["sample_rate"] == 24000
+

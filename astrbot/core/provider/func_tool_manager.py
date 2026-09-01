@@ -252,7 +252,10 @@ class _PermissionGuardedTool(FunctionTool):
 
         # @filter.llm_tool decorated tools have a handler attribute, which is the actual callable.
         if self._wrapped.handler is not None:
-            event = context.context.event
+            if hasattr(context, "context") and hasattr(context.context, "event"):
+                event = context.context.event
+            else:
+                event = context
             result = self._wrapped.handler(event, **kwargs)
             if _inspect.isasyncgen(result):
                 last: Any = None

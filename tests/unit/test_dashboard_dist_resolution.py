@@ -4,6 +4,7 @@ import logging
 
 import pytest
 
+from astrbot.core import logger
 from astrbot.core.config.default import VERSION
 from astrbot.core.dashboard_assets import resolve_dashboard_dist
 
@@ -24,8 +25,12 @@ class TestExplicitWebuiDir:
         """The happy path must not add startup noise."""
         dist = _make_dist(tmp_path / "webui", f"v{VERSION}")
 
-        with caplog.at_level(logging.WARNING):
-            resolved = resolve_dashboard_dist(dist)
+        logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.WARNING):
+                resolved = resolve_dashboard_dist(dist)
+        finally:
+            logger.removeHandler(caplog.handler)
 
         assert resolved is not None
         assert str(resolved) == str(tmp_path / "webui")
@@ -35,8 +40,12 @@ class TestExplicitWebuiDir:
         """A stale packaged WebUI must not be swapped in silently."""
         dist = _make_dist(tmp_path / "webui", "v0.0.1")
 
-        with caplog.at_level(logging.WARNING):
-            resolved = resolve_dashboard_dist(dist)
+        logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.WARNING):
+                resolved = resolve_dashboard_dist(dist)
+        finally:
+            logger.removeHandler(caplog.handler)
 
         assert resolved is not None  # behaviour unchanged: still served
         assert WARNING_FRAGMENT in caplog.text
@@ -47,8 +56,12 @@ class TestExplicitWebuiDir:
         """Assets without a version marker cannot be verified, so say so."""
         dist = _make_dist(tmp_path / "webui", None)
 
-        with caplog.at_level(logging.WARNING):
-            resolved = resolve_dashboard_dist(dist)
+        logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.WARNING):
+                resolved = resolve_dashboard_dist(dist)
+        finally:
+            logger.removeHandler(caplog.handler)
 
         assert resolved is not None
         assert WARNING_FRAGMENT in caplog.text
@@ -56,15 +69,23 @@ class TestExplicitWebuiDir:
 
     def test_nonexistent_dir_falls_through(self, tmp_path, caplog):
         """A path that does not exist must not be reported as a stale dist."""
-        with caplog.at_level(logging.WARNING):
-            resolve_dashboard_dist(str(tmp_path / "does-not-exist"))
+        logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.WARNING):
+                resolve_dashboard_dist(str(tmp_path / "does-not-exist"))
+        finally:
+            logger.removeHandler(caplog.handler)
 
         assert WARNING_FRAGMENT not in caplog.text
 
     @pytest.mark.parametrize("empty", ["", None])
     def test_no_explicit_dir_falls_through(self, empty, caplog):
         """Without --webui-dir the managed/bundled resolution path is used."""
-        with caplog.at_level(logging.WARNING):
-            resolve_dashboard_dist(empty)
+        logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.WARNING):
+                resolve_dashboard_dist(empty)
+        finally:
+            logger.removeHandler(caplog.handler)
 
         assert WARNING_FRAGMENT not in caplog.text

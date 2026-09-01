@@ -98,8 +98,42 @@ class ProviderGoogleGenAI(Provider):
         if proxy:
             async_client_kwargs["proxy"] = proxy
             async_client_kwargs["trust_env"] = False
+            logger.info(f"[Gemini] 使用代理: {proxy}")
+
+            import os
+
+            no_proxy = os.environ.get("no_proxy", os.environ.get("NO_PROXY", ""))
+            if not no_proxy:
+                try:
+                    from astrbot.core import astrbot_config
+
+                    no_proxy_list = astrbot_config.get("no_proxy", [])
+                    if isinstance(no_proxy_list, list):
+                        no_proxy = ",".join(no_proxy_list)
+                except Exception as config_err:
+                    logger.debug(f"[Gemini] 读取全局 no_proxy 失败: {config_err}")
+
+            logger.info(f"[Gemini] 代理绕过检测 - no_proxy 列表: {no_proxy}")
+            if no_proxy:
+                mounts = {}
+                for host in no_proxy.split(","):
+                    host = host.strip()
+                    if not host:
+                        continue
+                    if "://" in host:
+                        mounts[host] = None
+                    else:
+                        if ":" in host and not (
+                            host.startswith("[") and host.endswith("]")
+                        ):
+                            host = f"[{host}]"
+                        mounts[f"all://*{host}"] = None
+                        mounts[f"all://{host}"] = None
+                async_client_kwargs["mounts"] = mounts
+                logger.info(f"[Gemini] 已加载代理绕过 mounts: {list(mounts.keys())}")
         else:
             async_client_kwargs["trust_env"] = True
+            logger.info("[Gemini] 未配置独立代理，使用 trust_env=True")
 
         # Track the previous client so it can be closed in terminate() instead
         # of leaking when _init_client is called again (e.g. via set_key).
@@ -332,6 +366,13 @@ class ProviderGoogleGenAI(Provider):
                 contents.append(content_cls(parts=part))
 
         gemini_contents: list[types.Content] = []
+        provider_config = getattr(self, "provider_config", None) or {}
+        native_tool_enabled = any(
+            [
+                provider_config.get("gm_native_coderunner", False),
+                provider_config.get("gm_native_search", False),
+            ],
+        )
         for message in payloads["messages"]:
             role, content = message["role"], message.get("content")
 
@@ -351,53 +392,61 @@ class ProviderGoogleGenAI(Provider):
 
             elif role == "assistant":
                 parts = []
-                if isinstance(content, str):
-                    parts.append(types.Part.from_text(text=content))
-                elif isinstance(content, list):
-                    thinking_signature = None
-                    text = ""
-                    for part in content:
-                        # for most cases, assistant content only contains two parts: think and text
-                        if part.get("type") == "think":
-                            thinking_signature = part.get("encrypted") or None
+                if content:
+                    if isinstance(content, str):
+                        parts.append(types.Part.from_text(text=content))
+                    elif isinstance(content, list):
+                        thinking_signature = None
+                        text = ""
+                        for part in content:
+                            # for most cases, assistant content only contains two parts: think and text
+                            if part.get("type") == "think":
+                                thinking_signature = part.get("encrypted") or None
+                            else:
+                                text += str(part.get("text"))
+
+                        if thinking_signature and isinstance(thinking_signature, str):
+                            try:
+                                thinking_signature = base64.b64decode(
+                                    thinking_signature
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    f"Failed to decode google gemini thinking signature: {e}",
+                                    exc_info=True,
+                                )
+                                thinking_signature = None
+
+                        if (
+                            not text
+                            and thinking_signature
+                            and "tool_calls" in message
+                            and any(
+                                isinstance(tool, dict)
+                                and isinstance(tool.get("extra_content"), dict)
+                                and isinstance(
+                                    tool["extra_content"].get("google"), dict
+                                )
+                                and tool["extra_content"]["google"].get(
+                                    "thought_signature"
+                                )
+                                for tool in message["tool_calls"]
+                            )
+                        ):
+                            # If the main content is empty but tool calls have thought signatures,
+                            # skip adding an empty text part to deduplicate the thinking signature in the main content and tool calls.
+                            pass
                         else:
-                            text += str(part.get("text"))
-
-                    if thinking_signature and isinstance(thinking_signature, str):
-                        try:
-                            thinking_signature = base64.b64decode(thinking_signature)
-                        except Exception as e:
-                            logger.warning(
-                                f"Failed to decode google gemini thinking signature: {e}",
-                                exc_info=True,
+                            parts.append(
+                                types.Part(
+                                    text=text,
+                                    thought_signature=thinking_signature,
+                                )
                             )
-                            thinking_signature = None
 
-                    if (
-                        not text
-                        and thinking_signature
-                        and "tool_calls" in message
-                        and any(
-                            isinstance(tool, dict)
-                            and isinstance(tool.get("extra_content"), dict)
-                            and isinstance(tool["extra_content"].get("google"), dict)
-                            and tool["extra_content"]["google"].get("thought_signature")
-                            for tool in message["tool_calls"]
-                        )
-                    ):
-                        # If the main content is empty but tool calls have thought signatures,
-                        # skip adding an empty text part to deduplicate the thinking signature in the main content and tool calls.
-                        pass
-                    else:
-                        parts.append(
-                            types.Part(
-                                text=text,
-                                thought_signature=thinking_signature,
-                            )
-                        )
-
-                if "tool_calls" in message:
-                    for tool in message["tool_calls"]:
+                tool_calls = message.get("tool_calls")
+                if not native_tool_enabled and tool_calls:
+                    for tool in tool_calls:
                         part = types.Part.from_function_call(
                             name=tool["function"]["name"],
                             args=json.loads(tool["function"]["arguments"]),
@@ -416,11 +465,16 @@ class ProviderGoogleGenAI(Provider):
                         parts.append(part)
 
                 if not parts:
+                    logger.warning("assistant 角色的消息内容为空，已添加空格占位")
+                    if native_tool_enabled and "tool_calls" in message:
+                        logger.warning(
+                            "检测到启用Gemini原生工具，且上下文中存在函数调用，建议使用 /reset 重置上下文",
+                        )
                     parts = [types.Part.from_text(text=" ")]
 
                 append_or_extend(gemini_contents, parts, types.ModelContent)
 
-            elif role == "tool":
+            elif role == "tool" and not native_tool_enabled:
                 func_name = message.get("name", message["tool_call_id"])
                 part = types.Part.from_function_response(
                     name=func_name,
@@ -741,61 +795,74 @@ class ProviderGoogleGenAI(Provider):
         accumulated_reasoning = ""
         final_response = None
 
-        async for chunk in result:
-            llm_response = LLMResponse("assistant", is_chunk=True)
+        try:
+            async for chunk in result:
+                llm_response = LLMResponse("assistant", is_chunk=True)
 
-            if not chunk.candidates:
-                logger.warning(f"Gemini stream chunk has empty candidates: {chunk}")
-                continue
-            if not chunk.candidates[0].content:
-                logger.warning(f"Gemini stream chunk has empty content: {chunk}")
-                continue
+                if not chunk.candidates:
+                    logger.warning(f"Gemini stream chunk has empty candidates: {chunk}")
+                    continue
+                if not chunk.candidates[0].content:
+                    logger.warning(f"Gemini stream chunk has empty content: {chunk}")
+                    continue
 
-            if chunk.candidates[0].content.parts and any(
-                part.function_call for part in chunk.candidates[0].content.parts
-            ):
-                llm_response = LLMResponse("assistant", is_chunk=False)
-                llm_response.raw_completion = chunk
-                llm_response.result_chain = self._process_content_parts(
-                    chunk.candidates[0],
-                    llm_response,
-                    validate_output=False,
-                )
-                llm_response.id = chunk.response_id
-                if chunk.usage_metadata:
-                    llm_response.usage = self._extract_usage(chunk.usage_metadata)
-                yield llm_response
-                return
-
-            _f = False
-
-            # 提取 reasoning content
-            reasoning = self._extract_reasoning_content(chunk.candidates[0])
-            if reasoning:
-                _f = True
-                accumulated_reasoning += reasoning
-                llm_response.reasoning_content = reasoning
-            if chunk.text:
-                _f = True
-                accumulated_text += chunk.text
-                llm_response.result_chain = MessageChain(chain=[Comp.Plain(chunk.text)])
-            if _f:
-                yield llm_response
-
-            if chunk.candidates[0].finish_reason:
-                # Process the final chunk for potential tool calls or other content
-                if chunk.candidates[0].content.parts:
-                    final_response = LLMResponse("assistant", is_chunk=False)
-                    final_response.raw_completion = chunk
-                    final_response.result_chain = self._process_content_parts(
+                if chunk.candidates[0].content.parts and any(
+                    part.function_call for part in chunk.candidates[0].content.parts
+                ):
+                    llm_response = LLMResponse("assistant", is_chunk=False)
+                    llm_response.raw_completion = chunk
+                    llm_response.result_chain = self._process_content_parts(
                         chunk.candidates[0],
-                        final_response,
+                        llm_response,
                         validate_output=False,
                     )
-                    final_response.id = chunk.response_id
+                    llm_response.id = chunk.response_id
                     if chunk.usage_metadata:
-                        final_response.usage = self._extract_usage(chunk.usage_metadata)
-                break
+                        llm_response.usage = self._extract_usage(chunk.usage_metadata)
+                    yield llm_response
+                    return
+
+                _f = False
+
+                # 提取 reasoning content
+                reasoning = self._extract_reasoning_content(chunk.candidates[0])
+                if reasoning:
+                    _f = True
+                    accumulated_reasoning += reasoning
+                    llm_response.reasoning_content = reasoning
+                if chunk.text:
+                    _f = True
+                    accumulated_text += chunk.text
+                    llm_response.result_chain = MessageChain(
+                        chain=[Comp.Plain(chunk.text)]
+                    )
+                if _f:
+                    yield llm_response
+
+                if chunk.candidates[0].finish_reason:
+                    # Process the final chunk for potential tool calls or other content
+                    if chunk.candidates[0].content.parts:
+                        final_response = LLMResponse("assistant", is_chunk=False)
+                        final_response.raw_completion = chunk
+                        final_response.result_chain = self._process_content_parts(
+                            chunk.candidates[0],
+                            final_response,
+                            validate_output=False,
+                        )
+                        final_response.id = chunk.response_id
+                        if chunk.usage_metadata:
+                            final_response.usage = self._extract_usage(
+                                chunk.usage_metadata
+                            )
+                    break
+        finally:
+            if hasattr(result, "aclose"):
+                try:
+                    await result.aclose()
+                except Exception as close_err:
+                    logger.debug(
+                        f"[Gemini] Error closing stream generator: {close_err}"
+                    )
 
         # Yield final complete response with accumulated text
         if not final_response:
