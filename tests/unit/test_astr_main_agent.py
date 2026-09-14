@@ -2072,7 +2072,7 @@ class TestBuildMainAgent:
         extra_text = "\n".join(
             part.text for part in result.provider_request.extra_user_content_parts
         )
-        assert "[Image Caption in quoted message]: quoted image caption" in extra_text
+        assert "<image_caption>quoted image caption</image_caption>" in extra_text
 
     @pytest.mark.asyncio
     async def test_build_main_agent_does_not_retry_quoted_image_caption_when_empty(
