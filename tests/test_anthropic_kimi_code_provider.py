@@ -910,12 +910,12 @@ async def test_tool_choice_empty_tool_list_skips_tool_choice(monkeypatch):
 @pytest.mark.asyncio
 async def test_anthropic_encode_image_data_uri():
     provider = anthropic_source.ProviderAnthropic.__new__(anthropic_source.ProviderAnthropic)
-    data_uri = "data:image/jpeg;base64,UklGRkAAAABXRUJQVlA4"
+    data_uri = "data:image/webp;base64,UklGRkAAAABXRUJQVlA4"
 
     # Test encode_image_bs64 returns the data URI directly and the detected mimetype
     res, mime = await provider.encode_image_bs64(data_uri)
     assert res == data_uri
-    assert mime == "image/jpeg"
+    assert mime == "image/webp"
 
     # Test assemble_context with a data URI in image_urls
     context = await provider.assemble_context(text="", image_urls=[data_uri])
@@ -923,5 +923,5 @@ async def test_anthropic_encode_image_data_uri():
     assert len(context["content"]) == 2  # text placeholder + image_part
     assert context["content"][1]["type"] == "image"
     assert context["content"][1]["source"]["type"] == "base64"
-    assert context["content"][1]["source"]["media_type"] == "image/jpeg"
+    assert context["content"][1]["source"]["media_type"] == "image/webp"
     assert context["content"][1]["source"]["data"] == "UklGRkAAAABXRUJQVlA4"

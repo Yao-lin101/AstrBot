@@ -2555,6 +2555,7 @@ class TestBuildMainAgent:
             patch("astrbot.core.astr_main_agent.AgentRunner") as mock_runner_cls,
             patch("astrbot.core.astr_main_agent.AstrAgentContext"),
             patch.object(Image, "convert_to_file_path", AsyncMock(return_value="/path/to/quoted.jpg")),
+            patch("astrbot.core.utils.image_input.prepare_model_image", AsyncMock(return_value=("/path/to/quoted.jpg", False, False, "/path/to/quoted.jpg"))),
         ):
             mock_runner = MagicMock()
             mock_runner.reset = AsyncMock()

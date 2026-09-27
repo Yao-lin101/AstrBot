@@ -62,7 +62,7 @@ class MockProvider(Provider):
         if self.should_call_tools:
             return LLMResponse(
                 role="assistant",
-                completion_text="我需要使用工具来帮助您",
+                completion_text=f"我需要使用工具来帮助您 step-{self.call_count}",
                 tools_call_name=["test_tool"],
                 tools_call_args=[{"query": "test"}],
                 tools_call_ids=["call_123"],

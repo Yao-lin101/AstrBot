@@ -211,7 +211,7 @@ def test_gemini_extract_usage_without_cache_keeps_full_prompt_tokens():
 @pytest.mark.asyncio
 async def test_gemini_encode_image_data_uri():
     provider = ProviderGoogleGenAI.__new__(ProviderGoogleGenAI)
-    data_uri = "data:image/jpeg;base64,UklGRkAAAABXRUJQVlA4"
+    data_uri = "data:image/webp;base64,UklGRkAAAABXRUJQVlA4"
 
     # Test encode_image_bs64 returns the data URI directly
     res = await provider.encode_image_bs64(data_uri)
