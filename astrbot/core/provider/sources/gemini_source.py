@@ -858,10 +858,14 @@ class ProviderGoogleGenAI(Provider):
                     llm_response = LLMResponse("assistant", is_chunk=True)
 
                     if not chunk.candidates:
-                        logger.warning(f"Gemini stream chunk has empty candidates: {chunk}")
+                        logger.warning(
+                            f"Gemini stream chunk has empty candidates: {chunk}"
+                        )
                         continue
                     if not chunk.candidates[0].content:
-                        logger.warning(f"Gemini stream chunk has empty content: {chunk}")
+                        logger.warning(
+                            f"Gemini stream chunk has empty content: {chunk}"
+                        )
                         continue
 
                     if chunk.candidates[0].content.parts and any(
@@ -887,12 +891,15 @@ class ProviderGoogleGenAI(Provider):
                                 # _process_content_parts already stored the reasoning
                                 # that came with the tool-call chunk itself, so append
                                 # to it instead of overwriting that part.
-                                llm_response.reasoning_content = accumulated_reasoning + (
-                                    llm_response.reasoning_content or ""
+                                llm_response.reasoning_content = (
+                                    accumulated_reasoning
+                                    + (llm_response.reasoning_content or "")
                                 )
                         llm_response.id = chunk.response_id
                         if chunk.usage_metadata:
-                            llm_response.usage = self._extract_usage(chunk.usage_metadata)
+                            llm_response.usage = self._extract_usage(
+                                chunk.usage_metadata
+                            )
                         yield llm_response
                         return
 
