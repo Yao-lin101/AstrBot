@@ -212,6 +212,9 @@ class Message(BaseModel):
     tool_call_id: str | None = None
     """The ID of the tool call."""
 
+    name: str | None = None
+    """The name of the author of this message. This is used to map tool calls to their responses."""
+
     _no_save: bool = PrivateAttr(default=False)
     _checkpoint_after: CheckpointData | None = PrivateAttr(default=None)
 
@@ -243,6 +246,8 @@ class Message(BaseModel):
             data.pop("tool_calls", None)
         if self.tool_call_id is None:
             data.pop("tool_call_id", None)
+        if self.name is None:
+            data.pop("name", None)
         return data
 
 

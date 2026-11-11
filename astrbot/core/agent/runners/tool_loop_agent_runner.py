@@ -345,6 +345,9 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         self._last_tool_name: str | None = None
         self._last_tool_args: dict[str, T.Any] | None = None
         self._same_tool_streak = 0
+        self._last_llm_response_text = None
+        self._last_llm_tool_calls = None
+        self._llm_response_repetition_count = 0
         self._step_budget_max: int | None = None
         self._step_budget_used = 0
         self._step_budget_notified: set[int] = set()
@@ -667,7 +670,18 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
     async def _iter_llm_responses(
         self, *, include_model: bool = True
     ) -> T.AsyncGenerator[LLMResponse, None]:
-        """Yields chunks *and* a final LLMResponse."""
+        """Yields chunks and a final LLMResponse.
+
+        Args:
+            include_model: Whether to include explicit model configuration in request payload.
+
+        Yields:
+            Chunks and a final LLMResponse.
+
+        Raises:
+            EmptyModelOutputError: If the provider returned an empty response and no tools
+                were executed yet.
+        """
         payload = {
             "contexts": self._sanitize_contexts_for_provider(self.run_context.messages),
             "func_tool": self._func_tool_for_provider(),
@@ -682,10 +696,21 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         if include_model:
             # For primary provider we keep explicit model selection if provided.
             payload["model"] = self.req.model
-        async for response in self._recorded_responses(
-            payload, streaming=self.streaming
-        ):
-            yield response
+        try:
+            async for response in self._recorded_responses(
+                payload, streaming=self.streaming
+            ):
+                yield response
+        except EmptyModelOutputError:
+            if self.req.tool_calls_result:
+                # If we have already executed tools in this request,
+                # an empty response from the LLM is a valid way to terminate the turn.
+                logger.info(
+                    "LLM returned empty response after tool executions; terminating loop."
+                )
+                yield LLMResponse(role="assistant", completion_text="")
+            else:
+                raise
 
     async def _iter_llm_responses_with_fallback(
         self,
@@ -1150,6 +1175,35 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         # 处理 LLM 响应
         llm_resp = llm_resp_result
 
+        # Check for identical consecutive responses to prevent infinite tool loops
+        current_tool_calls = None
+        if llm_resp.tools_call_name:
+            current_tool_calls = list(
+                zip(llm_resp.tools_call_name, llm_resp.tools_call_args or [])
+            )
+
+        if (
+            self._last_llm_response_text == llm_resp.completion_text
+            and self._last_llm_tool_calls == current_tool_calls
+            and (llm_resp.completion_text or current_tool_calls)
+        ):
+            self._llm_response_repetition_count += 1
+        else:
+            self._last_llm_response_text = llm_resp.completion_text
+            self._last_llm_tool_calls = current_tool_calls
+            self._llm_response_repetition_count = 1
+
+        if self._llm_response_repetition_count >= 3:
+            logger.warning(
+                "Agent detected repetition loop: LLM generated identical response 3 times consecutively. Terminating tool loop."
+            )
+            # Disable tools and clear tool calls to force completion and stop execution
+            if self.req:
+                self.req.func_tool = None
+            llm_resp.tools_call_name = []
+            llm_resp.tools_call_args = []
+            llm_resp.tools_call_ids = []
+
         if llm_resp.role == "err":
             # 如果 LLM 响应错误，转换到错误状态
             self.final_llm_resp = llm_resp
@@ -1421,6 +1475,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     role="tool",
                     tool_call_id=tool_call_id,
                     content=self._merge_follow_up_notice(content),
+                    name=func_tool_name,
                 ),
             )
 

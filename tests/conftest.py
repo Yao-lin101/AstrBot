@@ -131,6 +131,19 @@ def require_symlink(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def caplog(caplog):
+    """Extend pytest's caplog to also capture records from the astrbot logger."""
+    import logging
+
+    astrbot_logger = logging.getLogger("astrbot")
+    astrbot_logger.addHandler(caplog.handler)
+    try:
+        yield caplog
+    finally:
+        astrbot_logger.removeHandler(caplog.handler)
+
+
+@pytest.fixture
 def event_queue() -> Queue:
     """Create a shared asyncio queue fixture for tests."""
     return Queue()
