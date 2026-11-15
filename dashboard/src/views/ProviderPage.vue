@@ -408,7 +408,8 @@ const {
 
 const decisionHintKeys = {
   system_one_decision: 'decisionHints',
-  openai_decision: 'openaiDecisionHints'
+  openai_decision: 'openaiDecisionHints',
+  gemini_decision: 'geminiDecisionHints'
 }
 
 const legacyConfigSchema = computed(() => {
@@ -429,11 +430,7 @@ const legacyConfigSchema = computed(() => {
       if (items[field]) delete items[field].condition
     }
     if (items.api_base) items.api_base.hint = tm(`providers.${hintKey}.apiBase`)
-    if (items.model && providerType === 'openai_decision') {
-      items.model.hint = tm('providers.openaiDecisionHints.model')
-    } else if (items.model) {
-      items.model.hint = tm('providers.decisionHints.model')
-    }
+    if (items.model) items.model.hint = tm(`providers.${hintKey}.model`)
     if (items.custom_headers) {
       items.custom_headers.hint = tm('providers.decisionHints.customHeaders')
     }
