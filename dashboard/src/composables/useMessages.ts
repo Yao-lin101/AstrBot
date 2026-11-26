@@ -29,6 +29,8 @@ export interface MessagePart {
   };
   type: string;
   text?: string;
+  code?: string;
+  message?: string;
   think?: string;
   message_id?: string | number;
   selected_text?: string;
@@ -48,6 +50,8 @@ export interface ToolCall {
   result?: unknown;
   ts?: number;
   finished_ts?: number;
+  // "unknown": the turn ended before this call returned.
+  phase?: "unknown";
   [key: string]: unknown;
 }
 
@@ -804,10 +808,7 @@ export function useMessages(options: UseMessagesOptions) {
       });
     } catch (error) {
       if (!abort.signal.aborted) {
-        appendPlain(
-          botRecord,
-          `\n\n${String((error as Error)?.message || error)}`,
-        );
+        appendError(botRecord, error, "connection_error");
         console.error("Regenerate failed:", error);
       }
     } finally {
@@ -935,7 +936,7 @@ export function useMessages(options: UseMessagesOptions) {
       .catch((error) => {
         if (abort.signal.aborted) return;
         ensureBotRecordVisible(connection);
-        appendPlain(botRecord, `\n\n${String(error?.message || error)}`);
+        appendError(botRecord, error, "connection_error");
         console.error("SSE chat failed:", error);
       })
       .finally(async () => {
@@ -1111,7 +1112,7 @@ export function useMessages(options: UseMessagesOptions) {
         if (!connection.botRecord) continue;
         connection.errorShown = true;
         ensureBotRecordVisible(connection);
-        appendPlain(connection.botRecord, "\n\nWebSocket connection failed.");
+        appendError(connection.botRecord, "WebSocket connection failed.", "connection_error");
       }
     };
     ws.onclose = async () => {
@@ -1128,7 +1129,7 @@ export function useMessages(options: UseMessagesOptions) {
           connection.botRecord
         ) {
           ensureBotRecordVisible(connection);
-          appendPlain(connection.botRecord, "\n\nWebSocket connection closed.");
+          appendError(connection.botRecord, "WebSocket connection closed.", "connection_error");
         }
         delete activeConnections[connection.messageId];
       }
@@ -1158,7 +1159,7 @@ export function useMessages(options: UseMessagesOptions) {
         connection.errorShown = true;
         if (connection.botRecord) {
           ensureBotRecordVisible(connection);
-          appendPlain(connection.botRecord, "\n\nWebSocket connection failed.");
+          appendError(connection.botRecord, "WebSocket connection failed.", "connection_error");
         }
         console.error("Failed to send WebSocket payload:", error);
         void finishWebSocketStream(sessionId, messageId);
@@ -1181,14 +1182,14 @@ export function useMessages(options: UseMessagesOptions) {
       const payload = JSON.parse(event.data);
       const payloadMessageId =
         payload?.message_id == null ? "" : String(payload.message_id);
-      let connection = payloadMessageId
+      const connection = payloadMessageId
         ? activeConnections[payloadMessageId]
-        : undefined;
-      if (!connection) {
-        const candidates = getWebSocketConnections(sessionId);
-        connection = candidates[0];
-      }
-      if (connection?.transport !== "websocket" || !connection.botRecord) {
+        : getWebSocketConnections(sessionId)[0];
+      if (
+        connection?.transport !== "websocket" ||
+        connection.sessionId !== sessionId ||
+        !connection.botRecord
+      ) {
         return;
       }
       processStreamPayload(
@@ -1368,7 +1369,14 @@ export function useMessages(options: UseMessagesOptions) {
     }
     if (msgType === "error") {
       markMessageStarted(botRecord);
-      appendPlain(botRecord, `\n\n${String(data)}`);
+      appendError(botRecord, data);
+      // A failed run may send no "end", so mark unreturned calls here too; a
+      // late result clears the mark.
+      for (const part of botRecord.content.message) {
+        for (const tool of part.tool_calls || []) {
+          if (!tool.finished_ts) tool.phase = "unknown";
+        }
+      }
       return;
     }
     if (msgType === "complete" || msgType === "break") {
@@ -1393,6 +1401,13 @@ export function useMessages(options: UseMessagesOptions) {
     if (msgType === "end") {
       if (connection) connection.completed = true;
       markMessageStarted(botRecord);
+      // Calls still without a result when the turn ends never returned; the
+      // backend stores them the same way.
+      for (const part of botRecord.content.message) {
+        for (const tool of part.tool_calls || []) {
+          if (!tool.finished_ts) tool.phase = "unknown";
+        }
+      }
       return;
     }
 
@@ -1744,15 +1759,31 @@ function firstNonEmptyPartIndex(parts: MessagePart[]) {
   return parts.findIndex((part) => !isEmptyPlainPart(part));
 }
 
-export function appendPlain(record: ChatRecord, text: string, append = true) {
+/** Preserve error identity across stream transports and thread messages. */
+export function appendError(record: ChatRecord, error: unknown, code = "agent_error") {
   markMessageStarted(record);
+  const data = error && typeof error === "object"
+    ? error as { code?: unknown; message?: unknown }
+    : undefined;
+  record.content.message.push({
+    type: "error",
+    code: typeof data?.code === "string" ? data.code : code,
+    message: typeof data?.message === "string" ? data.message : payloadText(error),
+  });
+}
+
+export function appendPlain(record: ChatRecord, text: string, streaming = true) {
+  markMessageStarted(record);
+  if (!text) return;
   const content = record.content;
-  let last = content.message[content.message.length - 1];
-  if (!last || last.type !== "plain") {
-    last = { type: "plain", text: "" };
-    content.message.push(last);
+  const last = content.message[content.message.length - 1];
+  if (last?.type !== "plain") {
+    content.message.push({ type: "plain", text });
+    return;
   }
-  last.text = append ? `${last.text || ""}${text}` : text;
+  const previousText = last.text || "";
+  const separator = !streaming && previousText ? "\n\n" : "";
+  last.text = `${previousText}${separator}${text}`;
 }
 
 export function appendReasoningPart(record: ChatRecord, text: string) {
@@ -1797,6 +1828,8 @@ export function finishToolCall(record: ChatRecord, result: any) {
     if (part.type !== "tool_call" || !Array.isArray(part.tool_calls)) continue;
     const tool = part.tool_calls.find((item) => item.id === targetId);
     if (tool) {
+      // A late result supersedes an earlier "unknown" mark.
+      delete tool.phase;
       tool.result = result.result;
       tool.finished_ts = result.ts || Date.now() / 1000;
       return;

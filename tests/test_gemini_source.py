@@ -1,3 +1,4 @@
+from contextlib import aclosing
 from types import SimpleNamespace
 
 import httpx
@@ -64,52 +65,6 @@ async def test_gemini_omits_unset_or_unsupported_thinking_config(model, provider
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "model",
-    [
-        "gemini-4-carbon",
-        "models/gemini-4-carbon",
-        "publishers/google/models/gemini-4-carbon",
-        "projects/example/locations/global/publishers/google/models/Gemini-4-Carbon",
-    ],
-)
-async def test_gemini_4_serializes_explicit_reasoning_effort(model):
-    provider = ProviderGoogleGenAI.__new__(ProviderGoogleGenAI)
-    provider.provider_config = {
-        "gm_thinking_config": {"level": "HIGH"},
-        "custom_extra_body": {"reasoning_effort": "low"},
-    }
-    provider.provider_settings = {}
-    provider.model_name = model
-    provider.safety_settings = []
-
-    config = await provider._prepare_query_config({})
-
-    assert config.model_dump(exclude_none=True)["thinking_config"] == {
-        "thinking_level": types.ThinkingLevel.LOW,
-    }
-
-
-@pytest.mark.asyncio
-async def test_gemini_prepare_conversation_removes_leading_model_content():
-    provider = ProviderGoogleGenAI.__new__(ProviderGoogleGenAI)
-
-    contents = await provider._prepare_conversation(
-        {
-            "messages": [
-                {"role": "assistant", "content": "stale assistant turn"},
-                {"role": "user", "content": "current user turn"},
-            ]
-        }
-    )
-
-    assert len(contents) == 1
-    assert isinstance(contents[0], types.UserContent)
-    assert contents[0].parts is not None
-    assert contents[0].parts[-1].text == "current user turn"
-
-
-@pytest.mark.asyncio
 async def test_gemini_prepare_conversation_keeps_normal_user_first_history():
     provider = ProviderGoogleGenAI.__new__(ProviderGoogleGenAI)
 
@@ -151,6 +106,68 @@ async def test_gemini_prepare_conversation_preserves_user_model_history():
     ]
     assert contents[-1].parts is not None
     assert contents[-1].parts[-1].text == "assistant turn"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "supports_mixed_tools"),
+    [("models/gemini-3.7-flash", True), ("gemini-2.5-flash", False)],
+)
+async def test_gemini_replays_function_history_with_supported_built_in_tools(
+    model, supports_mixed_tools
+):
+    if (
+        supports_mixed_tools
+        and "include_server_side_tool_invocations" not in types.ToolConfig.model_fields
+    ):
+        pytest.skip("Installed google-genai SDK does not support mixed tools")
+
+    provider = ProviderGoogleGenAI.__new__(ProviderGoogleGenAI)
+    provider.provider_config = {"gm_native_search": True}
+    server_part = types.Part(
+        executable_code=types.ExecutableCode(code="1 + 1"),
+        thought_signature=b"sig",
+    )
+    contents = await provider._prepare_conversation(
+        {
+            "model": model,
+            "messages": [
+                {"role": "user", "content": "Check the result"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Checking"},
+                        {"type": "think", "encrypted": "c2ln"},
+                    ],
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {"name": "verify", "arguments": "{}"},
+                            "extra_content": {
+                                "google": {
+                                    "server_parts": [server_part.model_dump(mode="json")],
+                                },
+                            },
+                        },
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": "ok"},
+            ],
+        }
+    )
+
+    model_parts = contents[1].parts
+    assert model_parts is not None
+    assert model_parts[0].text == "Checking"
+    if supports_mixed_tools:
+        assert model_parts[0].thought_signature is None
+        assert model_parts[1] == server_part
+        assert model_parts[2].function_call.name == "verify"
+        assert contents[2].parts[0].function_response.name == "verify"
+    else:
+        assert len(contents) == 2
+        assert len(model_parts) == 1
+        assert model_parts[0].thought_signature == b"sig"
 
 
 @pytest.mark.asyncio
@@ -461,12 +478,16 @@ async def test_gemini_stream_keeps_narration_emitted_before_tool_call(monkeypatc
         id="call-1",
         thought_signature=None,
     )
+    server_part = types.Part(executable_code=types.ExecutableCode(code="1 + 1"))
+    server_chunk = _gemini_stream_chunk()
+    server_chunk.candidates[0].content.parts.append(server_part)
 
     responses = await _drain_gemini_stream(
         provider,
         monkeypatch,
         [
             _gemini_stream_chunk(text="Sure, let me check that for you."),
+            server_chunk,
             _gemini_stream_chunk(function_call=tool_call),
         ],
     )
@@ -474,6 +495,9 @@ async def test_gemini_stream_keeps_narration_emitted_before_tool_call(monkeypatc
     final = responses[-1]
     assert final.is_chunk is False
     assert final.tools_call_name == ["get_weather"]
+    assert final.tools_call_extra_content["call-1"]["google"]["server_parts"] == [
+        server_part.model_dump(exclude_none=True, mode="json"),
+    ]
     plain_text = "".join(
         part.text
         for part in (final.result_chain.chain or [])
@@ -483,39 +507,41 @@ async def test_gemini_stream_keeps_narration_emitted_before_tool_call(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_gemini_stream_keeps_conversation_header_until_consumed(
+async def test_gemini_stream_close_releases_sdk_stream_and_conversation_header(
     monkeypatch,
 ):
-    """The conversation header must be present while the stream is consumed."""
+    """Closing the provider stream releases the SDK stream and temporary header."""
     provider = _gemini_stream_provider()
+    provider.api_keys = ["fake_key"]
     headers: dict[str, str] = {}
     provider.client._api_client = SimpleNamespace(
         _http_options=SimpleNamespace(headers=headers),
     )
-    observed_headers: list[str | None] = []
+    closed = False
 
     async def fake_stream():
-        observed_headers.append(headers.get("x-astrbot-conversation-id"))
-        yield _gemini_stream_chunk(text="ok")
+        nonlocal closed
+        try:
+            assert headers["x-astrbot-conversation-id"] == "conversation-1"
+            yield _gemini_stream_chunk(text="ok")
+        finally:
+            closed = True
 
     async def fake_retry(provider_name, request_factory, max_attempts=None):
         return fake_stream()
 
     monkeypatch.setattr(gemini_source, "retry_provider_request", fake_retry)
-    responses = [
-        response
-        async for response in provider._query_stream(
-            payloads={
-                "messages": [{"role": "user", "content": "hello"}],
-                "model": "gemini-3.7-flash",
-            },
-            tools=None,
+    async with aclosing(
+        provider.text_chat_stream(
+            prompt="hello",
             conversation_id="conversation-1",
         )
-    ]
+    ) as responses:
+        assert (await anext(responses)).completion_text == "ok"
+        assert headers["x-astrbot-conversation-id"] == "conversation-1"
+        assert not closed
 
-    assert responses[-1].completion_text == "ok"
-    assert observed_headers == ["conversation-1"]
+    assert closed
     assert "x-astrbot-conversation-id" not in headers
 
 

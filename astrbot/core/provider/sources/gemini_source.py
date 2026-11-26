@@ -4,7 +4,7 @@ import json
 import logging
 import random
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from typing import Literal, cast
 
 import httpx
@@ -36,8 +36,17 @@ GEMINI_4_FALLBACK_THINKING_LEVELS = ("LOW", "MEDIUM", "HIGH", "XHIGH")
 GEMINI_4_THINKING_LEVELS = {
     "gemini-4-carbon": ("LOW", "MEDIUM", "HIGH"),
     "gemini-4-argon": ("LOW", "MEDIUM", "HIGH"),
+    "gemini-4-neon": ("LOW", "MEDIUM", "HIGH", "XHIGH"),
     "gemini-4-hydrogen": ("LOW", "MEDIUM", "HIGH", "XHIGH"),
 }
+
+_SERVER_SIDE_PART_ATTRS = (
+    "tool_call",
+    "tool_response",
+    "executable_code",
+    "code_execution_result",
+)
+_MIXED_TOOL_MODEL_PREFIXES = ("gemini-3-", "gemini-3.", "gemini-4")
 
 
 class SuppressNonTextPartsWarning(logging.Filter):
@@ -302,6 +311,7 @@ class ProviderGoogleGenAI(Provider):
             if url_context:
                 tool_list.append(types.Tool(url_context=types.UrlContext()))
 
+        has_builtin_tool = bool(tool_list)
         if tools:
             func_desc = tools.get_func_desc_google_genai_style()
             tool_list.append(
@@ -314,15 +324,34 @@ class ProviderGoogleGenAI(Provider):
         tool_config = None
         has_func_decl = tool_list and any(t.function_declarations for t in tool_list)
         if has_func_decl:
-            tool_config = types.ToolConfig(
-                function_calling_config=types.FunctionCallingConfig(
-                    mode=(
-                        types.FunctionCallingConfigMode.ANY
-                        if tool_choice == "required"
-                        else types.FunctionCallingConfigMode.AUTO
-                    )
-                )
+            # Built-in tools + function calling on Gemini 3/4 require server-side
+            # tool invocations and VALIDATED (or ANY) mode instead of AUTO.
+            combines_tools = has_builtin_tool and model_name.startswith(
+                _MIXED_TOOL_MODEL_PREFIXES
             )
+            if tool_choice == "required":
+                mode = types.FunctionCallingConfigMode.ANY
+            elif combines_tools:
+                mode = types.FunctionCallingConfigMode.VALIDATED
+            else:
+                mode = types.FunctionCallingConfigMode.AUTO
+            tool_config_kwargs = {
+                "function_calling_config": types.FunctionCallingConfig(mode=mode),
+            }
+            if combines_tools:
+                # google-genai<1.68.0 lacks this field and rejects unknown kwargs.
+                if (
+                    "include_server_side_tool_invocations"
+                    in types.ToolConfig.model_fields
+                ):
+                    tool_config_kwargs["include_server_side_tool_invocations"] = True
+                else:
+                    logger.warning(
+                        "Gemini built-in tool combination with function calling "
+                        "requires google-genai>=1.68.0; the installed SDK does not "
+                        "support it."
+                    )
+            tool_config = types.ToolConfig(**tool_config_kwargs)
 
         extra_body = self.provider_config.get("custom_extra_body")
         if extra_body is None:
@@ -495,12 +524,19 @@ class ProviderGoogleGenAI(Provider):
 
         gemini_contents: list[types.Content] = []
         provider_config = getattr(self, "provider_config", None) or {}
-        native_tool_enabled = any(
-            [
-                provider_config.get("gm_native_coderunner", False),
-                provider_config.get("gm_native_search", False),
-            ],
+        model = payloads.get("model") or getattr(self, "model_name", "")
+        model_name = model.rsplit("/", 1)[-1].lower()
+        # Keep the existing history workaround where mixed tool replay is unsupported.
+        skip_function_history = (
+            provider_config.get("gm_native_coderunner", False)
+            or provider_config.get("gm_native_search", False)
+        ) and (
+            not model_name.startswith(_MIXED_TOOL_MODEL_PREFIXES)
+            or "include_server_side_tool_invocations"
+            not in types.ToolConfig.model_fields
         )
+        # Map tool call IDs to function names for later tool result matching.
+        tool_id_to_name: dict[str, str] = {}
         for message in payloads["messages"]:
             role, content = message["role"], message.get("content")
 
@@ -520,90 +556,98 @@ class ProviderGoogleGenAI(Provider):
 
             elif role == "assistant":
                 parts = []
-                if content:
-                    if isinstance(content, str):
-                        parts.append(types.Part.from_text(text=content))
-                    elif isinstance(content, list):
-                        thinking_signature = None
-                        text = ""
-                        for part in content:
-                            # for most cases, assistant content only contains two parts: think and text
-                            if part.get("type") == "think":
-                                thinking_signature = part.get("encrypted") or None
-                            else:
-                                text += str(part.get("text"))
-
-                        if thinking_signature and isinstance(thinking_signature, str):
+                tool_parts: list[types.Part] = []
+                tool_calls = message.get("tool_calls") or []
+                if not skip_function_history:
+                    for tool in tool_calls:
+                        extra_content = tool.get("extra_content") or {}
+                        google_extra = extra_content.get("google") or {}
+                        function_name = tool["function"]["name"]
+                        if tool.get("id"):
+                            tool_id_to_name[tool["id"]] = function_name
+                        # Replay server-side tool parts unchanged (with their thought signatures).
+                        for server_side_part in google_extra.get("server_parts") or []:
                             try:
-                                thinking_signature = base64.b64decode(
-                                    thinking_signature
+                                tool_parts.append(
+                                    types.Part.model_validate(server_side_part)
                                 )
                             except Exception as e:
                                 logger.warning(
-                                    f"Failed to decode google gemini thinking signature: {e}",
+                                    "Failed to restore Gemini server-side tool part: %s",
+                                    e,
                                     exc_info=True,
                                 )
-                                thinking_signature = None
-
-                        if (
-                            not text
-                            and thinking_signature
-                            and "tool_calls" in message
-                            and any(
-                                isinstance(tool, dict)
-                                and isinstance(tool.get("extra_content"), dict)
-                                and isinstance(
-                                    tool["extra_content"].get("google"), dict
-                                )
-                                and tool["extra_content"]["google"].get(
-                                    "thought_signature"
-                                )
-                                for tool in message["tool_calls"]
-                            )
-                        ):
-                            # If the main content is empty but tool calls have thought signatures,
-                            # skip adding an empty text part to deduplicate the thinking signature in the main content and tool calls.
-                            pass
-                        else:
-                            parts.append(
-                                types.Part(
-                                    text=text,
-                                    thought_signature=thinking_signature,
-                                )
-                            )
-
-                tool_calls = message.get("tool_calls")
-                if not native_tool_enabled and tool_calls:
-                    for tool in tool_calls:
                         part = types.Part.from_function_call(
-                            name=tool["function"]["name"],
+                            name=function_name,
                             args=json.loads(tool["function"]["arguments"]),
                         )
                         # we should set thought_signature back to part if exists
                         # for more info about thought_signature, see:
                         # https://ai.google.dev/gemini-api/docs/thought-signatures
-                        if "extra_content" in tool and tool["extra_content"]:
-                            ts_bs64 = (
-                                tool["extra_content"]
-                                .get("google", {})
-                                .get("thought_signature")
+                        ts_bs64 = google_extra.get("thought_signature")
+                        if ts_bs64:
+                            part.thought_signature = base64.b64decode(ts_bs64)
+                        tool_parts.append(part)
+
+                if isinstance(content, str) and content:
+                    parts.append(types.Part.from_text(text=content))
+                elif isinstance(content, list) and content:
+                    thinking_signature = None
+                    text = ""
+                    for part in content:
+                        # for most cases, assistant content only contains two parts: think and text
+                        if part.get("type") == "think":
+                            thinking_signature = part.get("encrypted") or None
+                        else:
+                            text += str(part.get("text"))
+
+                    if thinking_signature and isinstance(thinking_signature, str):
+                        try:
+                            thinking_signature = base64.b64decode(thinking_signature)
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to decode google gemini thinking signature: {e}",
+                                exc_info=True,
                             )
-                            if ts_bs64:
-                                part.thought_signature = base64.b64decode(ts_bs64)
-                        parts.append(part)
+                            thinking_signature = None
+
+                    has_duplicate_thought_signature = bool(
+                        thinking_signature
+                        and any(
+                            tool_part.thought_signature == thinking_signature
+                            for tool_part in tool_parts
+                        )
+                    )
+                    if has_duplicate_thought_signature:
+                        # Omit duplicate thought_signature already carried by a tool/server part.
+                        if text:
+                            parts.append(types.Part(text=text))
+                    else:
+                        parts.append(
+                            types.Part(
+                                text=text,
+                                thought_signature=thinking_signature,
+                            )
+                        )
+
+                parts.extend(tool_parts)
 
                 if not parts:
-                    logger.warning("assistant 角色的消息内容为空，已添加空格占位")
-                    if native_tool_enabled and "tool_calls" in message:
+                    if skip_function_history and tool_calls:
                         logger.warning(
-                            "检测到启用Gemini原生工具，且上下文中存在函数调用，建议使用 /reset 重置上下文",
+                            "Gemini cannot replay function calls with the enabled built-in "
+                            "tools. Use /reset to clear the conversation history."
                         )
                     parts = [types.Part.from_text(text=" ")]
 
                 append_or_extend(gemini_contents, parts, types.ModelContent)
 
-            elif role == "tool" and not native_tool_enabled:
-                func_name = message.get("name", message["tool_call_id"])
+            elif role == "tool" and not skip_function_history:
+                tool_call_id = message["tool_call_id"]
+                # Resolve function name from preceding assistant tool calls via call ID.
+                func_name = message.get("name") or tool_id_to_name.get(
+                    tool_call_id, tool_call_id
+                )
                 part = types.Part.from_function_response(
                     name=func_name,
                     response={
@@ -726,6 +770,7 @@ class ProviderGoogleGenAI(Provider):
             for part in result_parts
         ):
             chain.append(Comp.Plain("这是图片"))
+        server_side_parts: list[dict] = []
         for part in result_parts:
             # Skip thinking parts — their text is already captured via
             # _extract_reasoning_content above.  Including them here would
@@ -760,9 +805,23 @@ class ProviderGoogleGenAI(Provider):
             ):
                 chain.append(Comp.Image.fromBytes(part.inline_data.data))
 
-            if ts := part.thought_signature:
-                # only keep the last thinking signature
+            if any(getattr(part, attr, None) for attr in _SERVER_SIDE_PART_ATTRS):
+                server_side_parts.append(
+                    part.model_dump(exclude_none=True, mode="json")
+                )
+            elif ts := part.thought_signature:
+                # Only keep the last thinking signature from non-server-side parts.
                 llm_response.reasoning_signature = base64.b64encode(ts).decode("utf-8")
+
+        # Store server-side parts on the first custom tool call for replay.
+        if server_side_parts and llm_response.tools_call_ids:
+            google_extra = llm_response.tools_call_extra_content.setdefault(
+                llm_response.tools_call_ids[0], {}
+            ).setdefault("google", {})
+            google_extra["server_parts"] = [
+                *server_side_parts,
+                *(google_extra.get("server_parts") or []),
+            ]
         chain_result = MessageChain(chain=chain)
         llm_response.result_chain = chain_result
         if validate_output:
@@ -933,6 +992,8 @@ class ProviderGoogleGenAI(Provider):
         accumulated_text = ""
         accumulated_reasoning = ""
         final_response = None
+        # Buffer server-side tool parts until a custom tool call is emitted.
+        pending_server_side_parts: list[dict] = []
 
         try:
             async with self._conversation_header(conversation_id):
@@ -950,9 +1011,9 @@ class ProviderGoogleGenAI(Provider):
                         )
                         continue
 
-                    if chunk.candidates[0].content.parts and any(
-                        part.function_call for part in chunk.candidates[0].content.parts
-                    ):
+                    chunk_parts = chunk.candidates[0].content.parts or []
+
+                    if chunk_parts and any(part.function_call for part in chunk_parts):
                         llm_response = LLMResponse("assistant", is_chunk=False)
                         llm_response.raw_completion = chunk
                         llm_response.result_chain = self._process_content_parts(
@@ -960,6 +1021,17 @@ class ProviderGoogleGenAI(Provider):
                             llm_response,
                             validate_output=False,
                         )
+                        # Prepend earlier server-side parts so replay keeps response order.
+                        if pending_server_side_parts and llm_response.tools_call_ids:
+                            google_extra = (
+                                llm_response.tools_call_extra_content.setdefault(
+                                    llm_response.tools_call_ids[0], {}
+                                ).setdefault("google", {})
+                            )
+                            google_extra["server_parts"] = [
+                                *pending_server_side_parts,
+                                *(google_extra.get("server_parts") or []),
+                            ]
                         # This response replaces the whole turn in conversation
                         # history, so keep the narration and reasoning that were
                         # already streamed before the tool call. Dropping them made
@@ -985,6 +1057,14 @@ class ProviderGoogleGenAI(Provider):
                         yield llm_response
                         return
 
+                    pending_server_side_parts.extend(
+                        part.model_dump(exclude_none=True, mode="json")
+                        for part in chunk_parts
+                        if any(
+                            getattr(part, attr, None)
+                            for attr in _SERVER_SIDE_PART_ATTRS
+                        )
+                    )
                     _f = False
 
                     # 提取 reasoning content
@@ -1180,13 +1260,16 @@ class ProviderGoogleGenAI(Provider):
                 query_kwargs = {}
                 if conversation_id:
                     query_kwargs["conversation_id"] = conversation_id
-                async for response in self._query_stream(
-                    payloads,
-                    func_tool,
-                    request_max_retries=request_max_retries,
-                    **query_kwargs,
-                ):
-                    yield response
+                async with aclosing(
+                    self._query_stream(
+                        payloads,
+                        func_tool,
+                        request_max_retries=request_max_retries,
+                        **query_kwargs,
+                    )
+                ) as responses:
+                    async for response in responses:
+                        yield response
                 break
             except APIError as e:
                 if await self._handle_api_error(e, keys):

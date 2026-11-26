@@ -209,6 +209,8 @@ class Message(BaseModel):
     """The name of the author of this message. This is used to map tool calls to their responses."""
 
     _no_save: bool = PrivateAttr(default=False)
+    _turn_continuation: bool = PrivateAttr(default=False)
+    """Whether a generated user-role message continues the current user turn."""
 
     @model_validator(mode="after")
     def check_content_required(self):
@@ -260,13 +262,13 @@ class SystemMessageSegment(Message):
 
 
 def load_messages(history: list[dict]) -> list[Message]:
-    """Load working messages while restoring temporary-content markers.
+    """Load working messages with temporary-content and turn-boundary markers.
 
     Args:
         history: Serialized conversation messages.
 
     Returns:
-        Validated messages with their temporary-content markers restored.
+        Validated messages with their internal context markers restored.
 
     Raises:
         ValueError: A message has an invalid role or content.
@@ -276,6 +278,8 @@ def load_messages(history: list[dict]) -> list[Message]:
         message = Message.model_validate(item)
         if item.get("_no_save"):
             message._no_save = True
+        if item.get("_turn_continuation"):
+            message._turn_continuation = True
         messages.append(message)
 
     return messages
@@ -284,18 +288,20 @@ def load_messages(history: list[dict]) -> list[Message]:
 def dump_messages(
     messages: list[Message], *, include_temporary: bool = False
 ) -> list[dict]:
-    """Serialize working messages with optional temporary-content markers.
+    """Serialize working messages with turn boundaries and optional exclusions.
 
     Args:
         messages: Runtime working messages.
         include_temporary: Preserve exclusion markers for the event journal.
 
     Returns:
-        Serialized messages with optional temporary-content markers.
+        Serialized messages retaining turn boundaries and optional exclusions.
     """
     dumped: list[dict] = []
     for message in messages:
         message_data = message.model_dump()
+        if message._turn_continuation:
+            message_data["_turn_continuation"] = True
         if include_temporary and message._no_save:
             message_data["_no_save"] = True
         if isinstance(message.content, list):
